@@ -133,7 +133,7 @@
             transform:translateX(-50%) translateY(80px);
             background:var(--vino); color:white;
             padding:11px 22px; border-radius:50px; font-size:0.9rem;
-            z-index:9000; transition:transform 0.3s ease; white-space:nowrap;
+            z-index:30000; transition:transform 0.3s ease; white-space:nowrap;
         }
         .toast.show { transform:translateX(-50%) translateY(0); }
     </style>
@@ -184,9 +184,19 @@
 <div class="toast" id="toast"></div>
 
 <script>
+    // ── Config ──
     const CLOUD_NAME    = 'dxkpjqk5l';
     const UPLOAD_PRESET = 'lejplfwo';
     const FOLDER        = 'album';
+
+    const SUPA_URL = 'https://aklxmmlpulrxajcvulft.supabase.co';
+    const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFrbHhtbWxwdWxyeGFqY3Z1bGZ0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzgwOTY3MTEsImV4cCI6MjA5MzY3MjcxMX0.wDhM-1UBcZaiyK4ljuB6TfDVW5UVkpaeikODzXaj8G4';
+
+    const HEADERS = {
+        'apikey': SUPA_KEY,
+        'Authorization': `Bearer ${SUPA_KEY}`,
+        'Content-Type': 'application/json'
+    };
 
     let fotos = [];
     let indiceActual = 0;
@@ -211,7 +221,7 @@
         setTimeout(() => toast.classList.remove('show'), ms);
     }
 
-    // ── Cargar TODAS las fotos con paginación ──
+    // ── Cargar fotos desde Supabase ──
     async function cargarFotos() {
         gallery.innerHTML = '';
         for (let i = 0; i < 8; i++) {
@@ -220,33 +230,13 @@
             sk.style.height = (100 + Math.random() * 140) + 'px';
             gallery.appendChild(sk);
         }
-
         try {
-            let todas = [];
-            let nextCursor = null;
-
-            // Cloudinary lista de recursos paginada — máx 500 por llamada
-            do {
-                const url = nextCursor
-                    ? `https://res.cloudinary.com/${CLOUD_NAME}/image/list/${FOLDER}.json?next_cursor=${nextCursor}`
-                    : `https://res.cloudinary.com/${CLOUD_NAME}/image/list/${FOLDER}.json`;
-
-                const res  = await fetch(url);
-                const data = await res.json();
-
-                todas = todas.concat(data.resources || []);
-                nextCursor = data.next_cursor || null;
-
-            } while (nextCursor);
-
-            // Ordenar por fecha descendente (más nueva primero)
-            todas.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-            fotos = todas.map(r => ({
-                url: `https://res.cloudinary.com/${CLOUD_NAME}/image/upload/q_auto,f_auto/${r.public_id}`,
-                public_id: r.public_id
-            }));
-
+            const res = await fetch(
+                `${SUPA_URL}/rest/v1/fotos?select=*&order=created_at.desc&limit=1000`,
+                { headers: HEADERS }
+            );
+            const data = await res.json();
+            fotos = data.map(f => ({ id: f.id, url: f.url, public_id: f.public_id }));
             renderGaleria();
         } catch(e) {
             console.error(e);
@@ -274,26 +264,44 @@
         });
     }
 
-    // ── Subir ──
+    // ── Subir foto ──
     fileInput.addEventListener('change', async () => {
         const archivos = Array.from(fileInput.files);
         if (!archivos.length) return;
         mostrarToast(`Subiendo ${archivos.length} foto${archivos.length > 1 ? 's' : ''}...`, 99999);
         let subidas = 0;
+
         for (const archivo of archivos) {
-            const fd = new FormData();
-            fd.append('file', archivo);
-            fd.append('upload_preset', UPLOAD_PRESET);
-            fd.append('folder', FOLDER);
             try {
-                const res  = await fetch(`https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`, { method:'POST', body:fd });
-                const data = await res.json();
-                if (data.secure_url) {
-                    fotos.unshift({ url: data.secure_url, public_id: data.public_id });
+                // 1. Subir a Cloudinary
+                const fd = new FormData();
+                fd.append('file', archivo);
+                fd.append('upload_preset', UPLOAD_PRESET);
+                fd.append('folder', FOLDER);
+                const resCloud = await fetch(
+                    `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/image/upload`,
+                    { method: 'POST', body: fd }
+                );
+                const dataCloud = await resCloud.json();
+                if (!dataCloud.secure_url) continue;
+
+                // 2. Guardar en Supabase
+                const resSupa = await fetch(`${SUPA_URL}/rest/v1/fotos`, {
+                    method: 'POST',
+                    headers: { ...HEADERS, 'Prefer': 'return=representation' },
+                    body: JSON.stringify({
+                        url: dataCloud.secure_url,
+                        public_id: dataCloud.public_id
+                    })
+                });
+                const dataSupa = await resSupa.json();
+                if (dataSupa[0]) {
+                    fotos.unshift({ id: dataSupa[0].id, url: dataSupa[0].url, public_id: dataSupa[0].public_id });
                     subidas++;
                 }
             } catch(e) { console.error(e); }
         }
+
         fileInput.value = '';
         renderGaleria();
         toast.classList.remove('show');
@@ -340,24 +348,41 @@
         confirmOverlay.classList.add('open');
     });
     btnCancelConf.addEventListener('click', () => confirmOverlay.classList.remove('open'));
-    btnDeleteConf.addEventListener('click', () => {
+
+    btnDeleteConf.addEventListener('click', async () => {
         confirmOverlay.classList.remove('open');
-        fotos.splice(indiceActual, 1);
-        if (!fotos.length) {
-            cerrarModal();
+        const foto = fotos[indiceActual];
+        mostrarToast('Eliminando...', 99999);
+
+        try {
+            // Borrar de Supabase
+            await fetch(`${SUPA_URL}/rest/v1/fotos?id=eq.${foto.id}`, {
+                method: 'DELETE',
+                headers: HEADERS
+            });
+
+            fotos.splice(indiceActual, 1);
+            toast.classList.remove('show');
+
+            if (!fotos.length) {
+                cerrarModal();
+                renderGaleria();
+                mostrarToast('Foto eliminada ✓');
+                return;
+            }
+            indiceActual = Math.min(indiceActual, fotos.length - 1);
+            modalImg.classList.add('fade');
+            setTimeout(() => {
+                modalImg.src = fotos[indiceActual].url;
+                actualizarCounter();
+                modalImg.classList.remove('fade');
+            }, 150);
             renderGaleria();
             mostrarToast('Foto eliminada ✓');
-            return;
+        } catch(e) {
+            toast.classList.remove('show');
+            mostrarToast('Error al eliminar');
         }
-        indiceActual = Math.min(indiceActual, fotos.length - 1);
-        modalImg.classList.add('fade');
-        setTimeout(() => {
-            modalImg.src = fotos[indiceActual].url;
-            actualizarCounter();
-            modalImg.classList.remove('fade');
-        }, 150);
-        renderGaleria();
-        mostrarToast('Foto eliminada de la vista ✓');
     });
 
     document.addEventListener('keydown', e => {
